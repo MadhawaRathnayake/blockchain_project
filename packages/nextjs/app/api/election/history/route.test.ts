@@ -22,6 +22,7 @@ const CHAIN_ID = 31337;
 const REGISTRY = "0x0000000000000000000000000000000000000aa0";
 const DIV_A = "0x0000000000000000000000000000000000000cc0";
 const DIV_B = "0x0000000000000000000000000000000000000cc1";
+const WEB = "0x0000000000000000000000000000000000000dd0";
 
 const mocks = vi.hoisted(() => ({
   getLogs: vi.fn(),
@@ -44,7 +45,7 @@ vi.mock("~~/utils/serverChain", () => ({
 }));
 
 vi.mock("~~/contracts/deployedContracts", () => ({
-  default: { [CHAIN_ID]: { ElectionRegistry: { address: REGISTRY } } },
+  default: { [CHAIN_ID]: { ElectionRegistry: { address: REGISTRY }, WebVoting: { address: WEB } } },
 }));
 
 type StubLog = {
@@ -255,5 +256,81 @@ describe("GET /api/election/history", () => {
       { candidate: "Alice", votes: 1 },
     ]);
     expect(body.cycles[0].totalVotes).toBe(3);
+  });
+
+  describe("web votes", () => {
+    const webVote = (division: string, electionId: bigint, candidate: bigint) =>
+      log(WEB, "WebVoteCast", { votingContract: division, electionId, voter: "0x1", candidate });
+
+    it("adds web votes to their division's election, with turnout based on app votes", async () => {
+      stubChain([
+        log(REGISTRY, "DivisionAdded", { divisionId: 0n, name: "Kaduwela", votingContract: DIV_A, gnOfficer: "0x0" }),
+        log(DIV_A, "CandidatesUpdated", { candidates: ["Alice", "Bob"] }),
+        log(DIV_A, "NewLeaf", { index: 0n, value: 1n }),
+        log(DIV_A, "NewLeaf", { index: 1n, value: 2n }),
+        log(DIV_A, "VoteCast", { candidate: 0n }),
+        webVote(DIV_A, 0n, 1n),
+        webVote(DIV_A, 0n, 1n),
+        webVote(DIV_A, 0n, 0n),
+        log(DIV_A, "ElectionReset", { electionId: 1n }),
+        log(REGISTRY, "DivisionsCleared", { count: 1n }),
+      ]);
+
+      const body = await callRoute();
+
+      const [cycle] = body.cycles;
+      expect(cycle.results).toEqual([
+        { candidate: "Alice", votes: 2 },
+        { candidate: "Bob", votes: 2 },
+      ]);
+      expect(cycle.totalVotes).toBe(4);
+      expect(cycle.appVotes).toBe(1);
+      expect(cycle.webVotes).toBe(3);
+      // 1 app vote from 2 registered voters — web voters never register.
+      expect(cycle.turnout).toBe(0.5);
+      expect(cycle.divisions[0].elections[0]).toMatchObject({ voteCounts: [2, 2], webVoteCounts: [1, 2] });
+    });
+
+    it("keeps web votes for the live election out of history", async () => {
+      stubChain([
+        log(REGISTRY, "DivisionAdded", { divisionId: 0n, name: "Kaduwela", votingContract: DIV_A, gnOfficer: "0x0" }),
+        log(DIV_A, "CandidatesUpdated", { candidates: ["Alice", "Bob"] }),
+        webVote(DIV_A, 0n, 0n),
+        log(DIV_A, "ElectionReset", { electionId: 1n }),
+        log(REGISTRY, "DivisionsCleared", { count: 1n }),
+        log(REGISTRY, "DivisionAdded", { divisionId: 0n, name: "Kaduwela", votingContract: DIV_A, gnOfficer: "0x0" }),
+        log(DIV_A, "CandidatesUpdated", { candidates: ["Alice", "Bob"] }),
+        webVote(DIV_A, 1n, 1n),
+      ]);
+
+      const body = await callRoute();
+
+      expect(body.cycleCount).toBe(1);
+      expect(body.cycles[0].webVotes).toBe(1);
+      expect(body.cycles[0].results).toEqual([
+        { candidate: "Alice", votes: 1 },
+        { candidate: "Bob", votes: 0 },
+      ]);
+    });
+
+    it("splits web votes across a mid-cycle reset of the division", async () => {
+      stubChain([
+        log(REGISTRY, "DivisionAdded", { divisionId: 0n, name: "Kaduwela", votingContract: DIV_A, gnOfficer: "0x0" }),
+        log(DIV_A, "CandidatesUpdated", { candidates: ["Alice", "Bob"] }),
+        webVote(DIV_A, 0n, 0n),
+        log(DIV_A, "ElectionReset", { electionId: 1n }),
+        log(DIV_A, "CandidatesUpdated", { candidates: ["Alice", "Bob"] }),
+        webVote(DIV_A, 1n, 1n),
+        webVote(DIV_A, 1n, 1n),
+        log(DIV_A, "ElectionReset", { electionId: 2n }),
+        log(REGISTRY, "DivisionsCleared", { count: 1n }),
+      ]);
+
+      const body = await callRoute();
+
+      const elections = body.cycles[0].divisions[0].elections;
+      expect(elections[0]).toMatchObject({ electionId: 0, webVoteCounts: [1, 0], voteCounts: [1, 0] });
+      expect(elections[1]).toMatchObject({ electionId: 1, webVoteCounts: [0, 2], voteCounts: [0, 2] });
+    });
   });
 });

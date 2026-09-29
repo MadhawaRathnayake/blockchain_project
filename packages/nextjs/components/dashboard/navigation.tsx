@@ -5,6 +5,7 @@ import {
   // ArrowDownTrayIcon, // restore with the "Download App" link below
   // BugAntIcon, // restore with the "Debug" link below
   ChartBarIcon,
+  CheckBadgeIcon,
   ClockIcon,
   Cog6ToothIcon,
   HomeIcon,
@@ -39,6 +40,12 @@ export const baseMenuLinks: HeaderMenuLink[] = [
     href: "/",
     icon: <HomeIcon className={ICON_CLASS} />,
     description: "Project overview",
+  },
+  {
+    label: "Vote",
+    href: "/vote",
+    icon: <CheckBadgeIcon className={ICON_CLASS} />,
+    description: "Cast a web vote",
   },
   // Hidden from the sidebar for now. The `/voting` route itself still works and
   // keeps its entry in ROUTE_LABELS below, so anyone who follows a direct link
@@ -120,6 +127,7 @@ export type Crumb = { label: string; href?: string };
  */
 const ROUTE_LABELS: Record<string, string> = {
   "/": "Home",
+  "/vote": "Vote",
   "/voting": "Download App",
   "/voting/admin": "Election Admin",
   "/gn": "GN Portal",

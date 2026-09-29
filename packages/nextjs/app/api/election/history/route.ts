@@ -18,6 +18,11 @@ import { serverChainConfig } from "~~/utils/serverChain";
  * That is why this works on contracts deployed long before the feature existed,
  * and why it recovers elections that have already been reset and wiped.
  *
+ * Web votes (`/vote`) live in the separate `WebVoting` contract, whose
+ * `WebVoteCast` logs name the division contract they were cast against. They are
+ * folded into that division's log stream, and the positional partitioning below
+ * places them exactly like the division's own events.
+ *
  * The reconstruction is a two-level partition:
  *
  *   1. `DivisionsCleared` on the registry splits the chain into election
@@ -59,12 +64,21 @@ const VOTING_EVENTS = [
   ),
 ] as const;
 
+const WEB_VOTE_CAST = parseAbiItem(
+  "event WebVoteCast(address indexed votingContract, uint256 indexed electionId, address indexed voter, uint256 candidate)",
+);
+
 interface ReconstructedElection {
   electionId: number;
   question: string;
   candidates: string[];
+  /** App (ZK) votes plus web votes, per candidate. */
   voteCounts: number[];
+  /** The web-vote share of `voteCounts`. */
+  webVoteCounts: number[];
   totalVotes: number;
+  appVotes: number;
+  webVotes: number;
   registeredVoters: number;
   archivedAt: number;
 }
@@ -135,6 +149,16 @@ export async function GET() {
         logsByDivision.set(address.toLowerCase(), logs);
       }),
     );
+
+    // Web votes, attributed to the division contract each one names.
+    const webVoting = (deployedContracts as Record<number, any>)[CHAIN_ID]?.WebVoting;
+    if (webVoting?.address) {
+      const webLogs = await getLogsPaged(client, { address: webVoting.address, event: WEB_VOTE_CAST }, head);
+      for (const webLog of webLogs) {
+        const division = String(webLog.args.votingContract).toLowerCase();
+        logsByDivision.get(division)?.push(webLog);
+      }
+    }
 
     const boundaries = [...clearedLogs].sort((a, b) => (before(a, b) ? -1 : 1));
     const concludedAt = await Promise.all(
@@ -220,6 +244,7 @@ function splitIntoElections(logs: DecodedLog[], archivedAt: number): Reconstruct
     let candidates: string[] = [];
     let registeredVoters = 0;
     const tally = new Map<number, number>();
+    const webTally = new Map<number, number>();
 
     for (const log of segment.logs) {
       const { eventName, args } = log;
@@ -240,19 +265,30 @@ function splitIntoElections(logs: DecodedLog[], archivedAt: number): Reconstruct
           tally.set(index, (tally.get(index) ?? 0) + 1);
           break;
         }
+        case "WebVoteCast": {
+          const index = Number(args.candidate);
+          webTally.set(index, (webTally.get(index) ?? 0) + 1);
+          break;
+        }
       }
     }
 
     if (candidates.length === 0) return [];
 
-    const voteCounts = candidates.map((_, index) => tally.get(index) ?? 0);
+    const appVoteCounts = candidates.map((_, index) => tally.get(index) ?? 0);
+    const webVoteCounts = candidates.map((_, index) => webTally.get(index) ?? 0);
+    const appVotes = appVoteCounts.reduce((sum, count) => sum + count, 0);
+    const webVotes = webVoteCounts.reduce((sum, count) => sum + count, 0);
     return [
       {
         electionId: segment.electionId,
         question,
         candidates,
-        voteCounts,
-        totalVotes: voteCounts.reduce((sum, count) => sum + count, 0),
+        voteCounts: appVoteCounts.map((count, index) => count + webVoteCounts[index]),
+        webVoteCounts,
+        totalVotes: appVotes + webVotes,
+        appVotes,
+        webVotes,
         registeredVoters,
         archivedAt,
       },
@@ -268,10 +304,15 @@ function splitIntoElections(logs: DecodedLog[], archivedAt: number): Reconstruct
  * configured together — but history spans elections configured independently,
  * and silently adding "Yes" to "No" because both sat at index 0 would corrupt a
  * historical record rather than merely mis-render a live one.
+ *
+ * Turnout counts app votes only: web voters never register a commitment, so
+ * dividing all votes by registered voters could exceed 100%.
  */
 function summarise(divisions: ReconstructedDivision[]) {
   const totals = new Map<string, number>();
   let totalVotes = 0;
+  let appVotes = 0;
+  let webVotes = 0;
   let registeredVoters = 0;
   let question = "";
 
@@ -279,6 +320,8 @@ function summarise(divisions: ReconstructedDivision[]) {
     for (const election of division.elections) {
       if (!question) question = election.question;
       totalVotes += election.totalVotes;
+      appVotes += election.appVotes;
+      webVotes += election.webVotes;
       registeredVoters += election.registeredVoters;
       election.candidates.forEach((name, index) => {
         totals.set(name, (totals.get(name) ?? 0) + (election.voteCounts[index] ?? 0));
@@ -294,8 +337,10 @@ function summarise(divisions: ReconstructedDivision[]) {
     question,
     results,
     totalVotes,
+    appVotes,
+    webVotes,
     registeredVoters,
-    turnout: registeredVoters > 0 ? totalVotes / registeredVoters : 0,
+    turnout: registeredVoters > 0 ? appVotes / registeredVoters : 0,
   };
 }
 

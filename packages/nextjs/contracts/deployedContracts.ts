@@ -7,7 +7,7 @@ import { GenericContractsDeclaration } from "~~/utils/scaffold-eth/contract";
 const deployedContracts = {
   31337: {
     ElectionRegistry: {
-      address: "0x0165878A594ca255338adfa4d48449f69242Eb8F",
+      address: "0x4A679253410272dd5232B3Ff7cF5dbB88f295319",
       abi: [
         {
           inputs: [
@@ -446,10 +446,10 @@ const deployedContracts = {
         renounceOwnership: "@openzeppelin/contracts/access/Ownable.sol",
         transferOwnership: "@openzeppelin/contracts/access/Ownable.sol",
       },
-      deployedOnBlock: 12,
+      deployedOnBlock: 40,
     },
     HonkVerifier: {
-      address: "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0",
+      address: "0x59b670e9fA9D0A427751Af201D676719a970857b",
       abi: [
         {
           inputs: [],
@@ -497,10 +497,10 @@ const deployedContracts = {
         },
       ],
       inheritedFunctions: {},
-      deployedOnBlock: 5,
+      deployedOnBlock: 33,
     },
     LeanIMT: {
-      address: "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512",
+      address: "0xc6e7DF5E7b4f2A278906862b61205850344D4e7d",
       abi: [
         {
           inputs: [],
@@ -529,10 +529,10 @@ const deployedContracts = {
         },
       ],
       inheritedFunctions: {},
-      deployedOnBlock: 3,
+      deployedOnBlock: 31,
     },
     NicRegistry: {
-      address: "0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9",
+      address: "0x4ed7c70F96B99c776995fB64377f0d4aB3B0e1C1",
       abi: [
         {
           inputs: [
@@ -1089,10 +1089,10 @@ const deployedContracts = {
         renounceOwnership: "@openzeppelin/contracts/access/Ownable.sol",
         transferOwnership: "@openzeppelin/contracts/access/Ownable.sol",
       },
-      deployedOnBlock: 7,
+      deployedOnBlock: 35,
     },
     PoseidonT3: {
-      address: "0x5FbDB2315678afecb367f032d93F642f64180aa3",
+      address: "0x3Aa5ebB10DC797CAC828524e59A333d0A371443c",
       abi: [
         {
           inputs: [
@@ -1115,10 +1115,10 @@ const deployedContracts = {
         },
       ],
       inheritedFunctions: {},
-      deployedOnBlock: 1,
+      deployedOnBlock: 29,
     },
     Voting: {
-      address: "0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9",
+      address: "0x322813Fd9A801c5507c9de605d63CEA4f2CE6c44",
       abi: [
         {
           inputs: [
@@ -1906,10 +1906,10 @@ const deployedContracts = {
         renounceOwnership: "@openzeppelin/contracts/access/Ownable.sol",
         transferOwnership: "@openzeppelin/contracts/access/Ownable.sol",
       },
-      deployedOnBlock: 9,
+      deployedOnBlock: 37,
     },
     Voting_Colombo: {
-      address: "0xB7f8BC63BbcaD18155201308C8f3540b07f84F5e",
+      address: "0xE6E340D132b5f46d1e472DebcD681B2aBc16e57E",
       abi: [
         {
           inputs: [
@@ -2693,10 +2693,10 @@ const deployedContracts = {
         },
       ],
       inheritedFunctions: {},
-      deployedOnBlock: 19,
+      deployedOnBlock: 47,
     },
     Voting_Gampaha: {
-      address: "0x0B306BF915C4d645ff596e518fAf3F9669b97016",
+      address: "0xa82fF9aFd8f496c3d6ac40E2a0F282E47488CFc9",
       abi: [
         {
           inputs: [
@@ -3480,10 +3480,10 @@ const deployedContracts = {
         },
       ],
       inheritedFunctions: {},
-      deployedOnBlock: 24,
+      deployedOnBlock: 52,
     },
     Voting_Kaduwela: {
-      address: "0xa513E6E4b8f2a923D98304ec87F64353C4D5C853",
+      address: "0x7a2088a1bFc9d81c55368AE168C2C02570cB814F",
       abi: [
         {
           inputs: [
@@ -4267,7 +4267,179 @@ const deployedContracts = {
         },
       ],
       inheritedFunctions: {},
-      deployedOnBlock: 14,
+      deployedOnBlock: 42,
+    },
+    WebVoting: {
+      address: "0x95401dc811bb5740090279Ba06cfA8fcF6113778",
+      abi: [
+        {
+          inputs: [
+            {
+              internalType: "address",
+              name: "registry",
+              type: "address",
+            },
+          ],
+          stateMutability: "nonpayable",
+          type: "constructor",
+        },
+        {
+          inputs: [
+            {
+              internalType: "address",
+              name: "voter",
+              type: "address",
+            },
+          ],
+          name: "WebVoting__AlreadyVoted",
+          type: "error",
+        },
+        {
+          inputs: [
+            {
+              internalType: "uint256",
+              name: "candidate",
+              type: "uint256",
+            },
+          ],
+          name: "WebVoting__InvalidCandidate",
+          type: "error",
+        },
+        {
+          inputs: [],
+          name: "WebVoting__NoActiveDivision",
+          type: "error",
+        },
+        {
+          inputs: [
+            {
+              internalType: "uint8",
+              name: "phase",
+              type: "uint8",
+            },
+          ],
+          name: "WebVoting__NotVotingPhase",
+          type: "error",
+        },
+        {
+          anonymous: false,
+          inputs: [
+            {
+              indexed: true,
+              internalType: "address",
+              name: "votingContract",
+              type: "address",
+            },
+            {
+              indexed: true,
+              internalType: "uint256",
+              name: "electionId",
+              type: "uint256",
+            },
+            {
+              indexed: true,
+              internalType: "address",
+              name: "voter",
+              type: "address",
+            },
+            {
+              indexed: false,
+              internalType: "uint256",
+              name: "candidate",
+              type: "uint256",
+            },
+          ],
+          name: "WebVoteCast",
+          type: "event",
+        },
+        {
+          inputs: [
+            {
+              internalType: "address",
+              name: "voter",
+              type: "address",
+            },
+          ],
+          name: "getBallot",
+          outputs: [
+            {
+              internalType: "address",
+              name: "votingContract",
+              type: "address",
+            },
+            {
+              internalType: "string",
+              name: "divisionName",
+              type: "string",
+            },
+            {
+              internalType: "string",
+              name: "question",
+              type: "string",
+            },
+            {
+              internalType: "string[]",
+              name: "candidates",
+              type: "string[]",
+            },
+            {
+              internalType: "uint8",
+              name: "phase",
+              type: "uint8",
+            },
+            {
+              internalType: "uint256",
+              name: "votingEndTime",
+              type: "uint256",
+            },
+            {
+              internalType: "uint256",
+              name: "electionId",
+              type: "uint256",
+            },
+            {
+              internalType: "uint256[]",
+              name: "webVoteCounts",
+              type: "uint256[]",
+            },
+            {
+              internalType: "bool",
+              name: "hasVoted",
+              type: "bool",
+            },
+          ],
+          stateMutability: "view",
+          type: "function",
+        },
+        {
+          inputs: [],
+          name: "i_registry",
+          outputs: [
+            {
+              internalType: "contract IRegistryDivisions",
+              name: "",
+              type: "address",
+            },
+          ],
+          stateMutability: "view",
+          type: "function",
+        },
+        {
+          inputs: [
+            {
+              internalType: "uint256",
+              name: "candidate",
+              type: "uint256",
+            },
+          ],
+          name: "vote",
+          outputs: [],
+          stateMutability: "nonpayable",
+          type: "function",
+        },
+      ],
+      inheritedFunctions: {},
+      deployedOnBlock: 57,
     },
   },
 } as const;

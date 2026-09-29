@@ -22,8 +22,10 @@ interface ArchivedElection {
   electionId: number;
   question: string;
   candidates: string[];
+  /** App (ZK) votes plus web votes. */
   voteCounts: number[];
   totalVotes: number;
+  webVotes?: number;
   registeredVoters: number;
   archivedAt: number;
 }
@@ -42,6 +44,8 @@ interface Cycle {
   archivedAt: number;
   results: { candidate: string; votes: number }[];
   totalVotes: number;
+  /** Cast on /vote; already included in `totalVotes` and `results`. */
+  webVotes?: number;
   registeredVoters: number;
   turnout: number;
   divisions: ArchivedDivision[];
@@ -125,6 +129,7 @@ const ElectionHistory: NextPage = () => {
         {data.cycles.map(cycle => {
           const isOpen = expanded === cycle.cycleIndex;
           const winner = cycle.results[0];
+          const webVotes = cycle.webVotes ?? 0;
 
           return (
             <div key={cycle.cycleIndex} className="bg-base-100 rounded-2xl p-6 shadow-md border border-base-300/50">
@@ -134,7 +139,8 @@ const ElectionHistory: NextPage = () => {
               </div>
               <p className="text-sm opacity-60 mb-5">
                 {cycle.divisions.length} division{cycle.divisions.length === 1 ? "" : "s"} ·{" "}
-                {cycle.totalVotes.toLocaleString()} votes cast · {percent(cycle.turnout)} turnout
+                {cycle.totalVotes.toLocaleString()} votes cast
+                {webVotes > 0 && ` (${webVotes.toLocaleString()} web)`} · {percent(cycle.turnout)} turnout
                 {winner && ` · won by ${winner.candidate}`}
               </p>
 
@@ -176,6 +182,7 @@ const ElectionHistory: NextPage = () => {
                       <tr>
                         <th>Division</th>
                         <th className="text-right">Votes</th>
+                        {webVotes > 0 && <th className="text-right">Web</th>}
                         <th className="text-right">Registered</th>
                         <th>Contract</th>
                       </tr>
@@ -183,6 +190,7 @@ const ElectionHistory: NextPage = () => {
                     <tbody>
                       {cycle.divisions.map(division => {
                         const votes = division.elections.reduce((sum, e) => sum + e.totalVotes, 0);
+                        const divisionWebVotes = division.elections.reduce((sum, e) => sum + (e.webVotes ?? 0), 0);
                         const registered = division.elections.reduce((sum, e) => sum + e.registeredVoters, 0);
                         return (
                           <tr key={division.votingContract}>
@@ -193,6 +201,9 @@ const ElectionHistory: NextPage = () => {
                               )}
                             </td>
                             <td className="text-right tabular-nums">{votes.toLocaleString()}</td>
+                            {webVotes > 0 && (
+                              <td className="text-right tabular-nums">{divisionWebVotes.toLocaleString()}</td>
+                            )}
                             <td className="text-right tabular-nums">{registered.toLocaleString()}</td>
                             <td>
                               <a

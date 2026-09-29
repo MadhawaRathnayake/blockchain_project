@@ -2,8 +2,11 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { NextPage } from "next";
+import { zeroAddress } from "viem";
 import { usePublicClient } from "wagmi";
+import { useTargetNetwork } from "~~/hooks/scaffold-eth";
 import { PHASE_LABELS, useDivisions } from "~~/hooks/useDivisions";
+import { getDeployedAddress } from "~~/utils/deployedAddress";
 import { aggregateNationalResults } from "~~/utils/nationalResults";
 
 const PALETTES = [
@@ -20,6 +23,33 @@ const VOTING_RESULT_ABI = [
   { name: "getVoteCounts", type: "function", stateMutability: "view", inputs: [], outputs: [{ type: "uint256[]" }] },
 ] as const;
 
+/**
+ * `WebVoting.getBallot` — the web votes cast on /vote. They are counted against
+ * the first division's current election, index-aligned with its candidates.
+ */
+const WEB_BALLOT_ABI = [
+  {
+    name: "getBallot",
+    type: "function",
+    stateMutability: "view",
+    inputs: [{ name: "voter", type: "address" }],
+    outputs: [
+      { name: "votingContract", type: "address" },
+      { name: "divisionName", type: "string" },
+      { name: "question", type: "string" },
+      { name: "candidates", type: "string[]" },
+      { name: "phase", type: "uint8" },
+      { name: "votingEndTime", type: "uint256" },
+      { name: "electionId", type: "uint256" },
+      { name: "webVoteCounts", type: "uint256[]" },
+      { name: "hasVoted", type: "bool" },
+    ],
+  },
+] as const;
+
+/** Re-read so web votes appear without a reload; division changes still trigger an immediate read. */
+const REFRESH_MS = 5000;
+
 interface DivisionResult {
   id: number;
   name: string;
@@ -27,12 +57,20 @@ interface DivisionResult {
   phase: number;
   treeSize: number;
   candidates: string[];
+  /** App (ZK) votes plus web votes. */
   counts: number[];
+  /** The web-vote share of `counts`. */
+  webCounts: number[];
   totalVotes: number;
+  appVotes: number;
+  webVotes: number;
 }
 
 const ResultsDashboard: NextPage = () => {
   const publicClient = usePublicClient();
+  const { targetNetwork } = useTargetNetwork();
+  const webVotingAddress = useMemo(() => getDeployedAddress(targetNetwork.id, "WebVoting"), [targetNetwork.id]);
+  const [refreshTick, setRefreshTick] = useState(0);
   const { divisions, isLoading: divisionsLoading, error: divisionsError } = useDivisions();
 
   const [results, setResults] = useState<DivisionResult[]>([]);
@@ -42,6 +80,11 @@ const ResultsDashboard: NextPage = () => {
   const divisionsKey = useMemo(() => divisions.map(d => d.votingContract).join(","), [divisions]);
 
   useEffect(() => {
+    const timer = setInterval(() => setRefreshTick(t => t + 1), REFRESH_MS);
+    return () => clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
     let cancelled = false;
 
     const load = async () => {
@@ -49,7 +92,30 @@ const ResultsDashboard: NextPage = () => {
         if (!divisionsLoading) setLoadingResults(false);
         return;
       }
-      setLoadingResults(true);
+      // Only the first load shows the spinner; refreshes update in place.
+      if (refreshTick === 0) setLoadingResults(true);
+
+      // Web votes, keyed by the division contract they were cast against. A
+      // missing WebVoting deployment or an empty registry (getBallot reverts)
+      // just means there are none.
+      let web: { votingContract: string; counts: number[] } | null = null;
+      if (webVotingAddress) {
+        try {
+          const ballot = await publicClient.readContract({
+            address: webVotingAddress,
+            abi: WEB_BALLOT_ABI,
+            functionName: "getBallot",
+            args: [zeroAddress],
+          });
+          web = { votingContract: ballot[0].toLowerCase(), counts: ballot[7].map(Number) };
+        } catch {
+          web = null;
+        }
+      }
+      const webCountsFor = (votingContract: string, candidateCount: number): number[] => {
+        const counts = web && web.votingContract === votingContract.toLowerCase() ? web.counts : [];
+        return Array.from({ length: candidateCount }, (_, i) => counts[i] ?? 0);
+      };
 
       const enriched = await Promise.all(
         divisions.map(async (div): Promise<DivisionResult> => {
@@ -66,7 +132,10 @@ const ResultsDashboard: NextPage = () => {
                 functionName: "getVoteCounts",
               }),
             ]);
-            const countsNum = (counts as bigint[]).map(Number);
+            const appCounts = (counts as bigint[]).map(Number);
+            const webCounts = webCountsFor(div.votingContract, appCounts.length);
+            const appVotes = appCounts.reduce((s, c) => s + c, 0);
+            const webVotes = webCounts.reduce((s, c) => s + c, 0);
             return {
               id: div.id,
               name: div.name,
@@ -74,8 +143,11 @@ const ResultsDashboard: NextPage = () => {
               phase: div.phase,
               treeSize: div.treeSize,
               candidates: candidates as string[],
-              counts: countsNum,
-              totalVotes: countsNum.reduce((s, c) => s + c, 0),
+              counts: appCounts.map((c, i) => c + webCounts[i]),
+              webCounts,
+              totalVotes: appVotes + webVotes,
+              appVotes,
+              webVotes,
             };
           } catch {
             return {
@@ -86,7 +158,10 @@ const ResultsDashboard: NextPage = () => {
               treeSize: div.treeSize,
               candidates: [],
               counts: [],
+              webCounts: [],
               totalVotes: 0,
+              appVotes: 0,
+              webVotes: 0,
             };
           }
         }),
@@ -103,14 +178,18 @@ const ResultsDashboard: NextPage = () => {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [divisionsKey, publicClient, divisionsLoading]);
+  }, [divisionsKey, publicClient, divisionsLoading, webVotingAddress, refreshTick]);
 
   // Divisions each own their candidate list, so the national tally is combined
   // by candidate NAME — never by array position. See utils/nationalResults.
   const national = useMemo(() => aggregateNationalResults(results), [results]);
 
+  // Turnout counts app votes only: web voters never register, so including
+  // them could push turnout past 100%.
+  const nationalAppVotes = results.reduce((sum, div) => sum + div.appVotes, 0);
+  const nationalWebVotes = results.reduce((sum, div) => sum + div.webVotes, 0);
   const nationalTurnout =
-    national.totalRegistered > 0 ? ((national.totalVotes / national.totalRegistered) * 100).toFixed(1) : "0";
+    national.totalRegistered > 0 ? ((nationalAppVotes / national.totalRegistered) * 100).toFixed(1) : "0";
   const maxNational = Math.max(0, ...national.candidates.map(c => c.votes));
 
   const isLoading = divisionsLoading || loadingResults;
@@ -139,6 +218,11 @@ const ResultsDashboard: NextPage = () => {
           <div className="bg-base-100 rounded-xl p-4 shadow-sm border border-base-300/50 text-center">
             <div className="text-2xl font-bold text-primary">{national.totalVotes.toLocaleString()}</div>
             <div className="text-xs opacity-50">Total Votes</div>
+            {nationalWebVotes > 0 && (
+              <div className="text-[11px] opacity-40 mt-0.5">
+                {nationalAppVotes.toLocaleString()} app · {nationalWebVotes.toLocaleString()} web
+              </div>
+            )}
           </div>
           <div className="bg-base-100 rounded-xl p-4 shadow-sm border border-base-300/50 text-center">
             <div className="text-2xl font-bold text-secondary">{national.totalRegistered.toLocaleString()}</div>
@@ -219,7 +303,7 @@ const ResultsDashboard: NextPage = () => {
             {results.map(div => {
               const leadIdx = div.counts.reduce((best, c, i, arr) => (c > arr[best] ? i : best), 0);
               const open = expanded === div.id;
-              const divTurnout = div.treeSize > 0 ? ((div.totalVotes / div.treeSize) * 100).toFixed(1) : "0";
+              const divTurnout = div.treeSize > 0 ? ((div.appVotes / div.treeSize) * 100).toFixed(1) : "0";
               return (
                 <div key={div.votingContract} className="border border-base-300/50 rounded-xl overflow-hidden">
                   <button
@@ -231,7 +315,10 @@ const ResultsDashboard: NextPage = () => {
                       <span className="badge badge-ghost badge-sm">{PHASE_LABELS[div.phase]}</span>
                     </div>
                     <div className="flex items-center gap-4 text-sm">
-                      <span className="opacity-60">{div.totalVotes.toLocaleString()} votes</span>
+                      <span className="opacity-60">
+                        {div.totalVotes.toLocaleString()} votes
+                        {div.webVotes > 0 && ` (${div.webVotes.toLocaleString()} web)`}
+                      </span>
                       <span className="opacity-40">{divTurnout}% turnout</span>
                       <span className="opacity-40">{open ? "▲" : "▼"}</span>
                     </div>
@@ -241,6 +328,7 @@ const ResultsDashboard: NextPage = () => {
                       {div.candidates.length > 0 ? (
                         div.candidates.map((candidate, idx) => {
                           const count = div.counts[idx] ?? 0;
+                          const webCount = div.webCounts[idx] ?? 0;
                           const pct = div.totalVotes > 0 ? (count / div.totalVotes) * 100 : 0;
                           const palette = PALETTES[idx % PALETTES.length];
                           const isLeading = idx === leadIdx && count > 0;
@@ -250,6 +338,7 @@ const ResultsDashboard: NextPage = () => {
                                 <span className={isLeading ? "font-semibold" : ""}>{candidate}</span>
                                 <span className="opacity-60">
                                   {count.toLocaleString()} ({pct.toFixed(1)}%)
+                                  {webCount > 0 && ` · ${webCount.toLocaleString()} web`}
                                 </span>
                               </div>
                               <div className="w-full bg-base-300/30 rounded-full h-2 overflow-hidden">
