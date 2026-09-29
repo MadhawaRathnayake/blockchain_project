@@ -1,0 +1,69 @@
+# dependencies
+node_modules
+
+# yarn
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/sdks
+!.yarn/versions
+
+# eslint
+.eslintcache
+
+# misc
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode
+.idea
+
+# cli
+dist
+
+# noir circuit artifacts
+packages/circuits/target/
+
+# Next.js
+packages/nextjs/.next/
+
+# Expo / React Native
+packages/mobile/.expo/
+packages/mobile/ios/
+packages/mobile/android/
+packages/mobile/assets/circuit.json
+
+# Hardhat
+packages/hardhat/artifacts/
+packages/hardhat/cache/
+packages/hardhat/typechain-types/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Build outputs
+*.tsbuildinfo
+
+# LaTeX build artifacts (Conference paper & Final Report)
+*.aux
+*.log
+*.out
+*.toc
+*.lof
+*.lot
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.bbl
+*.blg
+*.nav
+*.snm
+*.vrb
+Conference paper/main.pdf
+Final Report/Report Template/Report.pdf
+Final Report/Report Template/Images/gen_*
+Final Report/guidelines*.txt

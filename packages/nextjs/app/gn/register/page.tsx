@@ -1,0 +1,784 @@
+"use client";
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import { NextPage } from "next";
+import decodeQR from "qr/decode.js";
+import type { Abi } from "viem";
+import { createPublicClient, http } from "viem";
+import { useAccount } from "wagmi";
+import { getWalletClient } from "wagmi/actions";
+import { useTargetNetwork } from "~~/hooks/scaffold-eth/useTargetNetwork";
+import { useElectionWriter } from "~~/hooks/useElectionWriter";
+import { useGnDivision } from "~~/hooks/useGnDivision";
+import { wagmiConfig } from "~~/services/web3/wagmiConfig";
+import { getDeployedAddress } from "~~/utils/deployedAddress";
+import { notification } from "~~/utils/scaffold-eth";
+
+const VOTING_ABI = [
+  { name: "s_gnOfficer", type: "function", stateMutability: "view", inputs: [], outputs: [{ type: "address" }] },
+  {
+    name: "addVoters",
+    type: "function",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "voters", type: "address[]" },
+      { name: "statuses", type: "bool[]" },
+    ],
+    outputs: [],
+  },
+  {
+    name: "Voting__SetupOrRegistrationRequired",
+    type: "error",
+    inputs: [{ name: "actual", type: "uint8" }],
+  },
+] as const;
+
+const NIC_REGISTRY_ABI = [
+  { name: "NicRegistry__AlreadyUsed", type: "error", inputs: [{ name: "nicHash", type: "bytes32" }] },
+  { name: "NicRegistry__AlreadyRegistered", type: "error", inputs: [{ name: "nicHash", type: "bytes32" }] },
+  { name: "NicRegistry__NotEnrolled", type: "error", inputs: [{ name: "nicHash", type: "bytes32" }] },
+  { name: "NicRegistry__DeviceInUse", type: "error", inputs: [{ name: "device", type: "address" }] },
+  { name: "NicRegistry__DeviceUnchanged", type: "error", inputs: [{ name: "device", type: "address" }] },
+  {
+    name: "NicRegistry__ReissueLimitReached",
+    type: "error",
+    inputs: [
+      { name: "nicHash", type: "bytes32" },
+      { name: "limit", type: "uint32" },
+    ],
+  },
+  {
+    name: "reserveNicHash",
+    type: "function",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "nicHash", type: "bytes32" },
+      { name: "votingContract", type: "address" },
+      { name: "device", type: "address" },
+    ],
+    outputs: [{ type: "bool" }],
+  },
+  {
+    name: "reissueDevice",
+    type: "function",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "nicHash", type: "bytes32" },
+      { name: "votingContract", type: "address" },
+      { name: "newDevice", type: "address" },
+    ],
+    outputs: [{ type: "address" }],
+  },
+  {
+    name: "getEnrolment",
+    type: "function",
+    stateMutability: "view",
+    inputs: [{ name: "nicHash", type: "bytes32" }],
+    outputs: [
+      { name: "votingContract", type: "address" },
+      { name: "device", type: "address" },
+      { name: "committed", type: "bool" },
+      { name: "issueCount", type: "uint32" },
+    ],
+  },
+] as const;
+
+const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
+
+/**
+ * What the chain already knows about this NIC, translated into the one decision
+ * the officer has to make.
+ *
+ * Read *before* writing anything, rather than inferred from a revert, because
+ * "replace this voter's device" is a deliberate act with a consequence — the
+ * previous phone stops working forever — and an officer should be shown that
+ * and asked, not have it happen because a first attempt failed.
+ */
+type EnrolmentPlan =
+  | { kind: "new" }
+  | { kind: "reissue"; previousDevice: `0x${string}`; issueCount: number }
+  | { kind: "blocked"; reason: string };
+
+/** Optional override; normally the address comes from the deployment record. */
+const NIC_REGISTRY_ADDRESS_OVERRIDE = process.env.NEXT_PUBLIC_NIC_REGISTRY_ADDRESS;
+
+/** Longest edge fed to the decoder — bigger frames cost time without helping. */
+const SCAN_MAX_EDGE = 640;
+
+/**
+ * Wait for the <video> to be committed to the DOM after `setScanning(true)`.
+ * Resolves null if it never appears (component unmounted).
+ */
+const waitForVideoEl = (ref: React.RefObject<HTMLVideoElement | null>, tries = 20): Promise<HTMLVideoElement | null> =>
+  new Promise(resolve => {
+    const tick = (left: number) => {
+      if (ref.current) return resolve(ref.current);
+      if (left <= 0) return resolve(null);
+      setTimeout(() => tick(left - 1), 25);
+    };
+    tick(tries);
+  });
+
+/** Grab the current video frame and try to decode a QR code out of it. */
+const decodeFrame = (
+  video: HTMLVideoElement,
+  canvasRef: React.MutableRefObject<HTMLCanvasElement | null>,
+): string | null => {
+  const scale = Math.min(1, SCAN_MAX_EDGE / Math.max(video.videoWidth, video.videoHeight));
+  const width = Math.round(video.videoWidth * scale);
+  const height = Math.round(video.videoHeight * scale);
+  if (!width || !height) return null;
+
+  const canvas = (canvasRef.current ??= document.createElement("canvas"));
+  canvas.width = width;
+  canvas.height = height;
+
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  if (!ctx) return null;
+  ctx.drawImage(video, 0, 0, width, height);
+
+  try {
+    // decodeQR throws when no code is present in the frame — that is the
+    // common case while the officer is still aiming.
+    return decodeQR(ctx.getImageData(0, 0, width, height)) || null;
+  } catch {
+    return null;
+  }
+};
+
+type Step = 1 | 2 | 3 | 4;
+
+const GNRegisterVoter: NextPage = () => {
+  const [step, setStep] = useState<Step>(1);
+  const [voterNIC, setVoterNIC] = useState("");
+  const [voterAddress, setVoterAddress] = useState("");
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  // Set when the chain says this NIC is already enrolled on a different, not yet
+  // registered device. Holds the officer at step 3 for an explicit confirmation.
+  const [pendingReissue, setPendingReissue] = useState<{ previousDevice: string; issueCount: number } | null>(null);
+  const [outcome, setOutcome] = useState<"enrolled" | "reissued">("enrolled");
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const scanTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [scanning, setScanning] = useState(false);
+
+  const { address } = useAccount();
+  const { division: myDivision, isLoading, identity, needsSignIn } = useGnDivision();
+  const { write } = useElectionWriter();
+
+  // Bound to the configured target network.
+  const { targetNetwork } = useTargetNetwork();
+
+  // Reads go direct to the target network's RPC, for the reason spelled out in
+  // `useDivisions`: wagmi's client follows the *wallet's* chain.
+  const publicClient = useMemo(
+    () => createPublicClient({ chain: targetNetwork, transport: http(targetNetwork.rpcUrls.default.http[0]) }),
+    [targetNetwork],
+  );
+
+  // NicRegistry is read from the deployment record for the target network. The
+  // NEXT_PUBLIC_ address is only an escape hatch for pointing at a registry
+  // deployed outside `yarn deploy`.
+  const nicRegistryAddress = useMemo(
+    () => getDeployedAddress(targetNetwork.id, "NicRegistry", NIC_REGISTRY_ADDRESS_OVERRIDE),
+    [targetNetwork.id],
+  );
+
+  // NIC validation (Sri Lankan format)
+  const validateNIC = (nic: string): boolean => {
+    const oldFormat = /^\d{9}[VvXx]$/;
+    const newFormat = /^\d{12}$/;
+    return oldFormat.test(nic) || newFormat.test(nic);
+  };
+
+  const handleVerifyNIC = () => {
+    if (!validateNIC(voterNIC)) {
+      notification.error("Invalid NIC format. Use 9 digits + V/X or 12-digit new format.");
+      return;
+    }
+    notification.success("NIC validated ✓");
+    setStep(2);
+  };
+
+  // QR Scanner
+  //
+  // `BarcodeDetector` is only shipped by a minority of browsers (Android Chrome,
+  // ChromeOS, macOS Chrome). On Windows Chrome/Edge, Firefox and Safari it is
+  // absent, so relying on it alone opens the camera but never decodes anything.
+  // The canvas + `decodeQR` path below is pure JS and works in every browser;
+  // `BarcodeDetector` is used first only as a faster native shortcut.
+  const startQRScan = async () => {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      notification.error("Camera requires HTTPS or localhost.");
+      return;
+    }
+
+    let stream: MediaStream;
+    try {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+      } catch {
+        stream = await navigator.mediaDevices.getUserMedia({ video: true });
+      }
+    } catch (err: any) {
+      if (err.name === "NotAllowedError") {
+        notification.error("Camera access denied by user or browser.");
+      } else if (err.name === "NotFoundError") {
+        notification.error("No camera found on this device.");
+      } else if (err.name === "NotReadableError" || err.message === "Could not start video source") {
+        notification.error("Camera is already in use by another app or tab.");
+      } else {
+        notification.error(err.message || "Camera access failed.");
+      }
+      return;
+    }
+
+    // The <video> is only mounted once `scanning` is true, so attach the stream
+    // after React has committed that render.
+    setScanning(true);
+    const video = await waitForVideoEl(videoRef);
+    if (!video) {
+      stream.getTracks().forEach(t => t.stop());
+      setScanning(false);
+      notification.error("Could not attach camera preview.");
+      return;
+    }
+
+    video.srcObject = stream;
+    try {
+      await video.play();
+    } catch {
+      /* autoplay rejection — the frame loop below tolerates a stalled video */
+    }
+
+    // Native detector when available; `decodeQR` otherwise.
+    let detector: any = null;
+    if ("BarcodeDetector" in window) {
+      try {
+        detector = new (window as any).BarcodeDetector({ formats: ["qr_code"] });
+      } catch {
+        detector = null;
+      }
+    }
+
+    if (scanTimerRef.current) clearInterval(scanTimerRef.current);
+    scanTimerRef.current = setInterval(async () => {
+      const v = videoRef.current;
+      // HAVE_CURRENT_DATA (2) is enough to grab a frame; live streams do not
+      // reliably reach HAVE_ENOUGH_DATA (4).
+      if (!v || v.readyState < 2 || !v.videoWidth) return;
+
+      if (detector) {
+        try {
+          const barcodes = await detector.detect(v);
+          if (barcodes.length > 0) {
+            stopCamera();
+            handleQRResult(barcodes[0].rawValue);
+            return;
+          }
+        } catch {
+          // Detector unusable on this frame/platform — fall through to decodeQR.
+          detector = null;
+        }
+      }
+
+      const text = decodeFrame(v, canvasRef);
+      if (text) {
+        stopCamera();
+        handleQRResult(text);
+      }
+    }, 250);
+  };
+
+  const stopCamera = () => {
+    if (scanTimerRef.current) {
+      clearInterval(scanTimerRef.current);
+      scanTimerRef.current = null;
+    }
+    if (videoRef.current?.srcObject) {
+      (videoRef.current.srcObject as MediaStream).getTracks().forEach(t => t.stop());
+      videoRef.current.srcObject = null;
+    }
+    setScanning(false);
+  };
+
+  const handleQRResult = (data: string) => {
+    try {
+      const parsed = JSON.parse(data);
+      if (parsed.address?.startsWith("0x")) {
+        setVoterAddress(parsed.address);
+        setPendingReissue(null);
+        notification.success(`Address scanned: ${parsed.address.slice(0, 10)}...`);
+        setStep(3);
+        return;
+      }
+    } catch {}
+    if (data.startsWith("0x") && data.length === 42) {
+      setVoterAddress(data);
+      setPendingReissue(null);
+      notification.success(`Address scanned: ${data.slice(0, 10)}...`);
+      setStep(3);
+    } else {
+      notification.error("Invalid QR code");
+    }
+  };
+
+  const handleManualAddress = () => {
+    if (!voterAddress.startsWith("0x") || voterAddress.length !== 42) {
+      notification.error("Invalid address. Must be 0x... (42 chars)");
+      return;
+    }
+    // A confirmation belongs to the address it was raised for; changing the
+    // address must not carry it over to a different phone.
+    setPendingReissue(null);
+    setStep(3);
+  };
+
+  /**
+   * Proves to `/api/nic/hash` that this caller is a serving GN officer.
+   *
+   * A wallet signature over the canonical NIC and a timestamp, checked against
+   * the on-chain officer list.
+   */
+  const nicHashHeaders = async (canonicalNic: string): Promise<HeadersInit> => {
+    if (!address) throw new Error("Wallet not connected.");
+    const walletClient = await getWalletClient(wagmiConfig);
+    if (!walletClient) throw new Error("Wallet not connected.");
+    const timestamp = Math.floor(Date.now() / 1000).toString();
+    const signature = await walletClient.signMessage({
+      account: address,
+      message: `SL Vote NIC hash\n${timestamp}\n${canonicalNic}`,
+    });
+    return {
+      "Content-Type": "application/json",
+      "x-gn-address": address,
+      "x-gn-signature": signature,
+      "x-gn-timestamp": timestamp,
+    };
+  };
+
+  /** Ask the server for this NIC's pepper-keyed hash. */
+  const fetchNicHash = async (): Promise<`0x${string}`> => {
+    const canonicalNic = voterNIC.trim().toUpperCase();
+    const hashResponse = await fetch("/api/nic/hash", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: await nicHashHeaders(canonicalNic),
+      body: JSON.stringify({ nic: voterNIC }),
+    });
+    const hashResult = await hashResponse.json();
+    if (!hashResponse.ok) throw new Error(hashResult.error || "Unable to hash NIC");
+    return hashResult.nicHash as `0x${string}`;
+  };
+
+  /**
+   * Decide what this enrolment *is* before writing anything.
+   *
+   * Four outcomes, and three of them are refusals the officer needs stated in
+   * their own terms: "already registered in the app" and "enrolled in another
+   * division" are completely different instructions to give the person standing
+   * in front of them, and neither of them is "this NIC belongs to another voter".
+   *
+   * Read first rather than inferred from a revert, because replacing a device is
+   * a deliberate act with a consequence the officer should be shown and asked
+   * about - the previous phone stops working, permanently.
+   */
+  const planEnrolment = async (nicHash: `0x${string}`): Promise<EnrolmentPlan> => {
+    if (!myDivision || !nicRegistryAddress) return { kind: "blocked", reason: "Division not resolved." };
+
+    const [enrolledDivision, device, committed, issueCount] = (await publicClient.readContract({
+      address: nicRegistryAddress,
+      abi: NIC_REGISTRY_ABI,
+      functionName: "getEnrolment",
+      args: [nicHash],
+    })) as [`0x${string}`, `0x${string}`, boolean, number];
+
+    if (enrolledDivision === ZERO_ADDRESS) return { kind: "new" };
+
+    if (committed) {
+      // The line the whole design turns on. Their commitment is already an
+      // anonymous leaf; nothing on chain can find it in order to replace it.
+      return {
+        kind: "blocked",
+        reason:
+          "This voter has already completed registration on their device. A registration cannot be moved to a " +
+          "new phone - their commitment is already anonymous in the tree, so there is no way to identify and replace it.",
+      };
+    }
+
+    if (enrolledDivision.toLowerCase() !== myDivision.votingContract.toLowerCase()) {
+      return {
+        kind: "blocked",
+        reason:
+          "This NIC is enrolled in a different division. The officer who enrolled them must issue the replacement.",
+      };
+    }
+
+    if (device.toLowerCase() === voterAddress.toLowerCase()) {
+      return {
+        kind: "blocked",
+        reason: "This phone is already the one issued for this NIC. Nothing to do - the voter can register in the app.",
+      };
+    }
+
+    return { kind: "reissue", previousDevice: device, issueCount: Number(issueCount) };
+  };
+
+  // Submit: reserve the NIC hash (or replace the device bound to it), then
+  // allowlist the voter on this GN's own division contract. Both writes go
+  // through the write seam and are signed by MetaMask.
+  const handleSubmit = async (confirmedReissue = false) => {
+    if (!voterAddress || !myDivision || !nicRegistryAddress) return;
+
+    setIsSubmitting(true);
+    try {
+      const nicHash = await fetchNicHash();
+      const plan = confirmedReissue && pendingReissue ? null : await planEnrolment(nicHash);
+
+      if (plan?.kind === "blocked") {
+        setPendingReissue(null);
+        notification.error(plan.reason);
+        return;
+      }
+      if (plan?.kind === "reissue") {
+        // Stop and ask. Confirming re-enters this function with the flag set.
+        setPendingReissue({ previousDevice: plan.previousDevice, issueCount: plan.issueCount });
+        return;
+      }
+
+      const isReissue = confirmedReissue && pendingReissue !== null;
+      const previousDevice = pendingReissue?.previousDevice;
+
+      if (isReissue) {
+        await write({
+          address: nicRegistryAddress,
+          abi: NIC_REGISTRY_ABI as unknown as Abi,
+          functionName: "reissueDevice",
+          args: [nicHash, myDivision.votingContract, voterAddress as `0x${string}`],
+        });
+      } else {
+        await write({
+          address: nicRegistryAddress,
+          abi: NIC_REGISTRY_ABI as unknown as Abi,
+          functionName: "reserveNicHash",
+          args: [nicHash, myDivision.votingContract, voterAddress as `0x${string}`],
+        });
+      }
+
+      // On a re-issue, drop the old address in the same call that adds the new
+      // one. This is hygiene, not the safety mechanism: `reissueDevice` has
+      // already marked the old device superseded and `register()` refuses it
+      // whether or not this call lands. Which is the point - if this transaction
+      // fails, the voter still cannot register twice.
+      const [addresses, statuses] =
+        isReissue && previousDevice
+          ? [
+              [previousDevice as `0x${string}`, voterAddress as `0x${string}`],
+              [false, true],
+            ]
+          : [[voterAddress as `0x${string}`], [true]];
+
+      await write({
+        address: myDivision.votingContract,
+        abi: VOTING_ABI as unknown as Abi,
+        functionName: "addVoters",
+        args: [addresses, statuses],
+      });
+
+      setOutcome(isReissue ? "reissued" : "enrolled");
+      setPendingReissue(null);
+      notification.success(
+        isReissue ? `✅ Replacement device issued in ${myDivision.name}!` : `✅ Voter added to ${myDivision.name}!`,
+      );
+      setStep(4);
+    } catch (error: any) {
+      const msg = error?.shortMessage || error?.message || "Transaction failed";
+      if (msg.includes("NicRegistry__AlreadyRegistered")) {
+        notification.error(
+          "This voter registered in the app between the check and this transaction. Their registration stands, " +
+            "and it cannot be moved to a new phone.",
+        );
+      } else if (msg.includes("NicRegistry__DeviceUnchanged")) {
+        // Almost always a retry after the allowlist half failed: the re-issue
+        // itself already landed, so say so rather than reporting a failure.
+        notification.error("This phone is already the issued device. Re-scan the voter roll step to finish.");
+      } else if (msg.includes("NicRegistry__DeviceInUse")) {
+        notification.error("This phone is already enrolled under another NIC. Ask the voter to reinstall the app.");
+      } else if (msg.includes("NicRegistry__ReissueLimitReached")) {
+        notification.error(
+          "This NIC has reached the replacement limit. The Election Authority must issue any further device.",
+        );
+      } else if (msg.includes("NicRegistry__WrongDivision")) {
+        notification.error("This NIC belongs to another division.");
+      } else if (msg.includes("NicRegistry__AlreadyUsed")) {
+        notification.error("This NIC is already registered to another voter");
+      } else if (msg.includes("Unregistered division")) {
+        // Not a permissions problem, and the raw revert string does not say so.
+        // The division exists and this officer is assigned to it, but it was
+        // never authorised in the NIC Registry — which only an admin can do, in
+        // section 7 of the admin panel. Divisions created by hand before that
+        // step was automatic land here.
+        notification.error(
+          "This division has not been authorised for voter enrolment yet. " +
+            "Ask the Election Authority to authorise it in section 7 of the admin panel, then try again.",
+        );
+      } else if (msg.includes("Not owner or GN")) {
+        notification.error("You are not authorized as GN for this division.");
+      } else if (
+        msg.includes("WrongPhase") ||
+        msg.includes("Cannot add voters") ||
+        msg.includes("SetupOrRegistrationRequired")
+      ) {
+        notification.error("Voters can only be added during the Setup or Registration phases.");
+      } else {
+        notification.error(msg);
+      }
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const resetForm = () => {
+    setStep(1);
+    setVoterNIC("");
+    setVoterAddress("");
+    setPendingReissue(null);
+    setOutcome("enrolled");
+  };
+
+  useEffect(() => {
+    return () => stopCamera();
+  }, []);
+
+  // Access gate: a wallet must be connected and must be the GN for a
+  // registered division.
+  if (needsSignIn) {
+    return <CenterMessage icon="🔒" title="Connect Wallet" subtitle="Connect your wallet to access the GN portal." />;
+  }
+  if (isLoading) {
+    return <CenterMessage icon="⏳" title="Checking authorization" subtitle="Reading your GN status from chain…" />;
+  }
+  if (!myDivision) {
+    return (
+      <CenterMessage
+        icon="🚫"
+        title="Not Authorized"
+        subtitle={`Your address (${identity?.slice(0, 10)}...) is not assigned as GN for any division.`}
+      />
+    );
+  }
+  if (!nicRegistryAddress) {
+    return (
+      <CenterMessage
+        icon="⚠️"
+        title="NIC Registry Not Deployed"
+        subtitle={`No NicRegistry in the deployment record for chain ${targetNetwork.id}. Run the deploy for this chain, or set NEXT_PUBLIC_NIC_REGISTRY_ADDRESS to override.`}
+      />
+    );
+  }
+
+  return (
+    <div className="flex flex-col items-center grow p-6 lg:p-8">
+      <div className="w-full max-w-lg">
+        {/* Header */}
+        <div className="text-center mb-6">
+          <h1 className="text-2xl font-bold">Register Voter</h1>
+          <p className="text-sm text-primary font-semibold">{myDivision.name} Division</p>
+          <p className="text-xs opacity-50 mt-1">
+            Step {step}/4 — {["Verify NIC", "Scan Address", "Confirm", "Done"][step - 1]}
+          </p>
+          <div className="flex gap-1 mt-3 justify-center">
+            {[1, 2, 3, 4].map(s => (
+              <div
+                key={`step-${s}`}
+                className={`h-1.5 w-16 rounded-full transition-all ${s <= step ? "bg-primary" : "bg-base-300"}`}
+              />
+            ))}
+          </div>
+        </div>
+
+        {/* Step 1: NIC */}
+        {step === 1 && (
+          <Card>
+            <h3 className="font-bold mb-4">🪪 Verify Voter NIC</h3>
+            <input
+              type="text"
+              placeholder="e.g., 200012345678 or 912345678V"
+              className="input input-bordered w-full mb-2"
+              value={voterNIC}
+              onChange={e => setVoterNIC(e.target.value.trim())}
+              maxLength={12}
+            />
+            <p className="text-xs opacity-50 mb-4">Old format: 9 digits + V/X · New: 12 digits</p>
+            <button className="btn btn-primary w-full" onClick={handleVerifyNIC} disabled={!voterNIC}>
+              Verify NIC →
+            </button>
+          </Card>
+        )}
+
+        {/* Step 2: Scan QR */}
+        {step === 2 && (
+          <Card>
+            <h3 className="font-bold mb-4">📷 Scan Voter&apos;s Address QR</h3>
+            <p className="text-sm opacity-60 mb-4">Ask voter to show the QR code from their app.</p>
+
+            {scanning ? (
+              <div className="relative rounded-xl overflow-hidden mb-4">
+                <video ref={videoRef} className="w-full rounded-xl" autoPlay playsInline muted />
+                <div className="absolute inset-0 border-4 border-primary/50 rounded-xl pointer-events-none" />
+                <button className="btn btn-sm btn-error absolute top-2 right-2" onClick={stopCamera}>
+                  Stop
+                </button>
+              </div>
+            ) : (
+              <button className="btn btn-primary w-full mb-4" onClick={startQRScan}>
+                📷 Open Camera
+              </button>
+            )}
+
+            <div className="divider text-xs opacity-50">OR paste manually</div>
+            <input
+              type="text"
+              placeholder="0x..."
+              className="input input-bordered w-full font-mono text-sm mb-3"
+              value={voterAddress}
+              onChange={e => setVoterAddress(e.target.value.trim())}
+            />
+            <button className="btn btn-outline w-full" onClick={handleManualAddress} disabled={!voterAddress}>
+              Use Address →
+            </button>
+          </Card>
+        )}
+
+        {/* Step 3: Confirm */}
+        {step === 3 && (
+          <Card>
+            <h3 className="font-bold mb-4">✅ Confirm & Register</h3>
+            <div className="space-y-2 mb-4">
+              <InfoRow label="Division" value={myDivision.name} />
+              <InfoRow label="NIC" value={voterNIC} />
+              <InfoRow label="Address" value={`${voterAddress.slice(0, 10)}...${voterAddress.slice(-6)}`} />
+            </div>
+
+            {/*
+              The lost-phone confirmation. Shown only when the chain says this NIC
+              is enrolled on a different device that has not registered yet — the
+              one window in which a replacement is possible at all.
+            */}
+            {pendingReissue ? (
+              <div className="rounded-xl border border-warning/40 bg-warning/10 p-4 mb-4">
+                <p className="font-bold text-sm mb-2">⚠️ This voter is already enrolled on another phone</p>
+                <p className="text-xs opacity-80 mb-2">
+                  Issuing this phone will permanently disable{" "}
+                  <span className="font-mono">
+                    {pendingReissue.previousDevice.slice(0, 10)}...{pendingReissue.previousDevice.slice(-6)}
+                  </span>
+                  . That phone will never be able to register, even if it is found later. The voter will be able to
+                  register once, on this phone only.
+                </p>
+                <p className="text-xs opacity-80 mb-3">
+                  Do this only if you have satisfied yourself that the previous phone is genuinely lost or broken.
+                  {pendingReissue.issueCount > 0 && (
+                    <>
+                      {" "}
+                      <strong>
+                        This NIC has already been replaced {pendingReissue.issueCount}{" "}
+                        {pendingReissue.issueCount === 1 ? "time" : "times"}.
+                      </strong>
+                    </>
+                  )}
+                </p>
+                <div className="flex gap-2">
+                  <button
+                    className={`btn btn-warning btn-sm grow ${isSubmitting ? "loading" : ""}`}
+                    onClick={() => handleSubmit(true)}
+                    disabled={isSubmitting}
+                  >
+                    {isSubmitting ? "Replacing…" : "Replace device"}
+                  </button>
+                  <button
+                    className="btn btn-ghost btn-sm"
+                    onClick={() => setPendingReissue(null)}
+                    disabled={isSubmitting}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <button
+                className={`btn btn-primary w-full ${isSubmitting ? "loading" : ""}`}
+                onClick={() => handleSubmit()}
+                disabled={isSubmitting}
+              >
+                {isSubmitting ? "Adding to Blockchain..." : "Confirm & Add to Voter Roll →"}
+              </button>
+            )}
+          </Card>
+        )}
+
+        {/* Step 4: Success */}
+        {step === 4 && (
+          <Card>
+            <div className="text-center">
+              <div className="text-5xl mb-4">✅</div>
+              <h3 className="font-bold text-xl mb-2">
+                {outcome === "reissued" ? "Replacement Device Issued!" : "Voter Enrolled!"}
+              </h3>
+              <p className="text-sm opacity-60 mb-1">
+                {voterAddress.slice(0, 14)}... added to <strong>{myDivision.name}</strong>
+              </p>
+              {outcome === "reissued" && (
+                <p className="text-xs opacity-60 mb-1">The previous phone can no longer register.</p>
+              )}
+              <p className="text-xs opacity-40 mb-6">NIC: {voterNIC}</p>
+              <button className="btn btn-primary" onClick={resetForm}>
+                Register Next Voter →
+              </button>
+            </div>
+          </Card>
+        )}
+
+        {/* Back */}
+        {step > 1 && step < 4 && (
+          <button className="btn btn-ghost btn-sm mt-4 w-full" onClick={() => setStep((step - 1) as Step)}>
+            ← Back
+          </button>
+        )}
+      </div>
+    </div>
+  );
+};
+
+export default GNRegisterVoter;
+
+// --- Helper components ---
+const Card = ({ children }: { children: React.ReactNode }) => (
+  <div className="bg-base-100 rounded-2xl p-6 shadow-md border border-base-300/50">{children}</div>
+);
+
+const InfoRow = ({ label, value }: { label: string; value: string }) => (
+  <div className="flex justify-between items-center p-3 bg-base-200/50 rounded-lg">
+    <span className="text-sm opacity-60">{label}</span>
+    <span className="font-mono text-sm font-bold">{value}</span>
+  </div>
+);
+
+const CenterMessage = ({
+  icon,
+  title,
+  subtitle,
+  action,
+}: {
+  icon: string;
+  title: string;
+  subtitle: string;
+  action?: React.ReactNode;
+}) => (
+  <div className="flex flex-col items-center justify-center grow p-6 lg:p-8 text-center">
+    <div className="text-5xl mb-4">{icon}</div>
+    <h1 className="text-2xl font-bold mb-2">{title}</h1>
+    <p className="opacity-60 max-w-md">{subtitle}</p>
+    {action && <div className="mt-4">{action}</div>}
+  </div>
+);

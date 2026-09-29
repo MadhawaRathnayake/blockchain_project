@@ -1,0 +1,67 @@
+{
+  "expo": {
+    "name": "SL Vote",
+    "slug": "sl-vote",
+    "version": "1.0.1",
+    "orientation": "portrait",
+    "scheme": "slvote",
+    "icon": "./assets/images/icon.png",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": false,
+    "splash": {
+      "image": "./assets/images/icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0F1B2D"
+    },
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "lk.app.slvote",
+      "infoPlist": {
+        "NSFaceIDUsageDescription": "SL Vote uses Face ID to protect your voting key."
+      }
+    },
+    "android": {
+      "package": "lk.app.slvote",
+      "versionCode": 2,
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/images/adaptive-icon-foreground.png",
+        "backgroundColor": "#0F1B2D"
+      },
+      "permissions": [
+        "USE_BIOMETRIC",
+        "USE_FINGERPRINT",
+        "INTERNET",
+        "android.permission.USE_BIOMETRIC",
+        "android.permission.USE_FINGERPRINT"
+      ]
+    },
+    "plugins": [
+      "expo-router",
+      "expo-secure-store",
+      [
+        "expo-local-authentication",
+        {
+          "faceIDPermission": "SL Vote uses Face ID to protect your voting key."
+        }
+      ],
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "usesCleartextTraffic": true
+          }
+        }
+      ]
+    ],
+    "experiments": {
+      "typedRoutes": true
+    },
+    "owner": "kavishkaravishan",
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "db21d0c7-0dc1-4094-bda3-33895a6d74e6"
+      }
+    }
+  }
+}
