@@ -25,15 +25,10 @@ This edition runs on a **local Hardhat chain (id 31337)**. The Election Authorit
 ```bash
 yarn install
 cp packages/nextjs/.env.example packages/nextjs/.env.local
+cp packages/mobile/.env.example packages/mobile/.env   # only if you run the mobile app
 ```
 
-In `packages/nextjs/.env.local`, set `SERVER_PEPPER` to a long random secret. Generate one with:
-
-```bash
-node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
-```
-
-The other values already default to the local Hardhat node.
+The example files contain this prototype's working values, so the web app runs without edits. For the mobile app, replace the IP in `packages/mobile/.env` with your machine's LAN IP. `packages/hardhat/.env.example` is only needed to deploy to a public network.
 
 ## Running
 
@@ -62,7 +57,7 @@ If MetaMask reports "nonce too high" after a chain restart, go to **Settings →
 
 ### Mobile app
 
-Create `packages/mobile/.env` with your machine's LAN IP. `localhost` does not work from a phone.
+Copy `packages/mobile/.env.example` to `packages/mobile/.env` and replace the IP with your machine's LAN IP. `localhost` does not work from a phone.
 
 ```
 EXPO_PUBLIC_API_URL=http://<LAN-IP>:3000
